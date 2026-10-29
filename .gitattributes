@@ -1,0 +1,10 @@
+# Normalise line endings so the repo is identical regardless of the OS it was committed from.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+*.jar binary
+*.png binary
+*.pdf binary

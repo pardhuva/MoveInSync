@@ -1,0 +1,40 @@
+# Build output
+target/
+build/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# Secrets and local configuration -- never commit these
+.env
+.env.*
+*.pem
+*.key
+application-local.yml
+application-local.yaml
+application-local.properties
+
+# Load-test and benchmark output (regenerated; results are transcribed into docs/)
+benchmarks/raw/
+*.hprof
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+nbproject/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+logs/
+*.log

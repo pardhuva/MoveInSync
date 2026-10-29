@@ -1,0 +1,89 @@
+server:
+  port: ${SERVER_PORT:8080}
+  # A frozen client must not be able to pin a request thread forever.
+  tomcat:
+    connection-timeout: 20s
+
+spring:
+  application:
+    name: live-trip-updates
+  # Redis is only contacted under the "redis" profile; see RedisDistributionConfig.
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+      lettuce:
+        pool:
+          max-active: 32
+          max-idle: 16
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # /actuator/prometheus is what the on-call dashboards scrape.
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    tags:
+      node: ${LIVETRIPS_NODE_ID:gw-local}
+
+livetrips:
+  # Identifies this gateway node in logs, metrics and the welcome frame.
+  node-id: ${LIVETRIPS_NODE_ID:gw-local}
+
+  auth:
+    # NEVER hardcode this. Supplied as an environment variable; if absent the service generates
+    # an ephemeral key at startup and logs a warning (tokens then die with the process and are
+    # not valid on other nodes). Must be >= 32 bytes for HS256.
+    jwt-secret: ${LIVETRIPS_JWT_SECRET:}
+    token-ttl: 1h
+    # How long an unauthenticated socket may stay open before it is closed.
+    handshake-timeout-ms: 10000
+
+  replay:
+    # Per-topic replay window, in events. This is the "bounded replay buffer": a client that
+    # missed more than this many events on a topic gets a snapshot instead of a replay.
+    # Memory cost: capacity x active topics x ~200 bytes.
+    capacity: ${LIVETRIPS_REPLAY_CAPACITY:500}
+    # Redis mode only: how long an idle topic's log and snapshot survive before being reclaimed.
+    topic-ttl: 24h
+
+  gateway:
+    # Per-connection bounded outbound queue, in events. Location updates conflate to one entry
+    # per cab, so steady-state depth is O(cabs watched), not O(events).
+    queue-capacity: ${LIVETRIPS_QUEUE_CAPACITY:1000}
+    # Shared pool that drains connection queues to sockets. Connections are drain-scheduled,
+    # so this is sized for concurrent *writers*, not for total connections.
+    writer-threads: ${LIVETRIPS_WRITER_THREADS:32}
+    # Caps per-connection bookkeeping and replay cost.
+    max-topics-per-connection: 50
+
+  publish:
+    # Each update is written to its trip, cab and office topics. Office topics are the most
+    # expensive stream (every cab in a site); disable to cut publish amplification by a third
+    # when no client subscribes at office level.
+    office-topics-enabled: ${LIVETRIPS_OFFICE_TOPICS:true}
+
+  cache:
+    # Authorisation metadata cache. ttl-ms is the staleness bound: an ownership change made on
+    # another node can be served stale for at most this long. Set to 0 to disable caching.
+    max-entries: 50000
+    ttl-ms: ${LIVETRIPS_CACHE_TTL_MS:30000}
+
+  demo:
+    # Seeds a small set of tenants, offices, trips and cabs at startup so the service is
+    # immediately demonstrable. Disable for anything resembling production.
+    seed-enabled: ${LIVETRIPS_SEED:true}
+
+logging:
+  level:
+    root: INFO
+    com.moveinsync.livetrips: ${LIVETRIPS_LOG_LEVEL:INFO}
+  pattern:
+    # Structured, grep-friendly, and deliberately free of request bodies: a location payload
+    # says where a named employee is right now, so it never reaches a log file.
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [${LIVETRIPS_NODE_ID:gw-local}] %logger{36} - %msg%n"
