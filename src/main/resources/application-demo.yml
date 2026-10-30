@@ -1,0 +1,14 @@
+# LOCAL DEMO PROFILE — activate with SPRING_PROFILES_ACTIVE=demo
+#
+# This is the ONLY configuration that opens the developer token endpoint. Everything here is for
+# a reviewer running the project on their own machine; none of it is safe for a real deployment.
+#
+#   POST /api/v1/dev/token mints a signed token for ANY claimed identity, bypassing authentication
+#   entirely. It exists so the demo and the sample curl calls work without an identity provider.
+#
+# With no profile active (the default), both switches below are false: the endpoint is not
+# registered at all (404) and no demo tenants are seeded.
+livetrips:
+  demo:
+    seed-enabled: true
+    token-endpoint-enabled: true

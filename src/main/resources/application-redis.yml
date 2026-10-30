@@ -1,0 +1,6 @@
+# Overrides applied only under the 'redis' profile (SPRING_PROFILES_ACTIVE=redis), i.e. the
+# multi-node Docker Compose topology. Redis is a real dependency here, so its health is surfaced.
+management:
+  health:
+    redis:
+      enabled: true
