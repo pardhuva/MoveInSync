@@ -1,0 +1,14 @@
+<configuration>
+    <!-- Test-time logging: quiet the per-event publish logs so load output is readable.
+         The application's real logging config lives in application.yml. -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level %logger{20} - %msg%n</pattern>
+        </encoder>
+    </appender>
+    <root level="WARN">
+        <appender-ref ref="STDOUT"/>
+    </root>
+    <!-- Service publish/subscribe logs are INFO/WARN; raise to ERROR during load to cut noise. -->
+    <logger name="com.moveinsync.livetrips.service" level="ERROR"/>
+</configuration>
