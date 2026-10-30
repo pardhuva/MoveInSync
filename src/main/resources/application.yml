@@ -27,6 +27,12 @@ management:
   endpoint:
     health:
       show-details: when-authorized
+  health:
+    # Single-node (default) mode contacts no Redis, so its health indicator would always report
+    # DOWN and drag the aggregate down. It is re-enabled in application-redis.yml under the
+    # 'redis' profile, where Redis is a genuine dependency whose health we DO want surfaced.
+    redis:
+      enabled: false
   metrics:
     tags:
       node: ${LIVETRIPS_NODE_ID:gw-local}
@@ -49,12 +55,19 @@ livetrips:
     # missed more than this many events on a topic gets a snapshot instead of a replay.
     # Memory cost: capacity x active topics x ~200 bytes.
     capacity: ${LIVETRIPS_REPLAY_CAPACITY:500}
+    # Per-topic ordered STATUS/SOS history, kept independently of the location-dominated replay
+    # window above. A location flood evicts the replay window but not this, so a client resuming
+    # on the snapshot path still receives the STATUS/SOS it missed. Miss more criticals than this
+    # and the resume is flagged as critical-truncated (latest state only for the gap).
+    critical-capacity: ${LIVETRIPS_CRITICAL_CAPACITY:256}
     # Redis mode only: how long an idle topic's log and snapshot survive before being reclaimed.
     topic-ttl: 24h
 
   gateway:
-    # Per-connection bounded outbound queue, in events. Location updates conflate to one entry
-    # per cab, so steady-state depth is O(cabs watched), not O(events).
+    # Per-connection bounded outbound queue, in events. The SOS express lane and the main lane are
+    # bounded independently, so the hard worst-case total per connection is 2 x this value; the SOS
+    # lane is near-empty in normal operation and locations conflate to one entry per cab, so
+    # steady-state depth is O(cabs watched), not O(events).
     queue-capacity: ${LIVETRIPS_QUEUE_CAPACITY:1000}
     # Shared pool that drains connection queues to sockets. Connections are drain-scheduled,
     # so this is sized for concurrent *writers*, not for total connections.
@@ -67,6 +80,15 @@ livetrips:
     # expensive stream (every cab in a site); disable to cut publish amplification by a third
     # when no client subscribes at office level.
     office-topics-enabled: ${LIVETRIPS_OFFICE_TOPICS:true}
+    # Ordered live dispatch. A topic maps by hash to one single-thread partition, so its events are
+    # distributed strictly in sequence order even under concurrent publishing. More partitions =
+    # more cross-topic parallelism; topics sharing a partition are serialised with each other.
+    # (SOS bypasses these partitions entirely so it still skips ahead.)
+    dispatch-partitions: ${LIVETRIPS_DISPATCH_PARTITIONS:16}
+    # Per-partition bounded queue. On saturation a live dispatch is DROPPED (counted by the
+    # livetrips.dispatch.dropped metric) rather than blocking the publisher. This is safe: the event
+    # is already in the replay log, so a client notices the sequence gap and resumes to recover it.
+    dispatch-queue-capacity: ${LIVETRIPS_DISPATCH_QUEUE:20000}
 
   cache:
     # Authorisation metadata cache. ttl-ms is the staleness bound: an ownership change made on
@@ -75,9 +97,14 @@ livetrips:
     ttl-ms: ${LIVETRIPS_CACHE_TTL_MS:30000}
 
   demo:
-    # Seeds a small set of tenants, offices, trips and cabs at startup so the service is
-    # immediately demonstrable. Disable for anything resembling production.
-    seed-enabled: ${LIVETRIPS_SEED:true}
+    # BOTH default to false so a plain run is secure. The local 'demo' profile
+    # (application-demo.yml, activated with SPRING_PROFILES_ACTIVE=demo) turns them on.
+    #
+    # Seeds demo tenants/offices/trips at startup.
+    seed-enabled: ${LIVETRIPS_SEED:false}
+    # Exposes POST /api/v1/dev/token, which mints a signed token for ANY claimed identity.
+    # NEVER enable this outside a local demo: it bypasses the entire authentication model.
+    token-endpoint-enabled: ${LIVETRIPS_DEV_TOKEN_ENDPOINT:false}
 
 logging:
   level:

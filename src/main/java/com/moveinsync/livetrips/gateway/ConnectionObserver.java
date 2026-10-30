@@ -22,4 +22,7 @@ public interface ConnectionObserver {
 
     /** A socket write failed; the connection is being closed. */
     default void onWriteFailure() { }
+
+    /** An SOS was flushed through the dedicated express drain path. */
+    default void onSosExpressDelivery() { }
 }

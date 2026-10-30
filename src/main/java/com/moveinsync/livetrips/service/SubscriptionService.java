@@ -2,6 +2,7 @@ package com.moveinsync.livetrips.service;
 
 import com.moveinsync.livetrips.auth.AuthenticatedPrincipal;
 import com.moveinsync.livetrips.core.AuthorizationDecision;
+import com.moveinsync.livetrips.core.CriticalHistory;
 import com.moveinsync.livetrips.core.EventLog;
 import com.moveinsync.livetrips.core.ReplayResult;
 import com.moveinsync.livetrips.core.SnapshotStore;
@@ -124,11 +125,11 @@ public class SubscriptionService {
 
             // 2. Decide the starting point.
             if (lastSeq <= 0) {
-                return startFromSnapshot(connection, topicKey, StartMode.SNAPSHOT);
+                return startFromSnapshot(connection, topicKey, lastSeq, StartMode.SNAPSHOT);
             }
             ReplayResult result = eventLog.replayFrom(topicKey, lastSeq);
             if (result.isSnapshotRequired()) {
-                return startFromSnapshot(connection, topicKey, StartMode.SNAPSHOT);
+                return startFromSnapshot(connection, topicKey, lastSeq, StartMode.SNAPSHOT);
             }
             if (result.events().isEmpty()) {
                 connection.sendNow(codec.subscribed(topicKey, StartMode.LIVE.name(),
@@ -139,7 +140,7 @@ public class SubscriptionService {
             connection.sendNow(codec.subscribed(topicKey, StartMode.REPLAY.name(),
                     result.latestSequence()));
             for (TripEvent event : result.events()) {
-                connection.sendEventNow(event);
+                connection.sendReplayEventNow(event);
             }
             metrics.resume(StartMode.REPLAY.name());
             log.debug("subscribe_replay user={} topic={} from={} count={}",
@@ -150,11 +151,34 @@ public class SubscriptionService {
         }
     }
 
-    private StartMode startFromSnapshot(ClientConnection connection, String topicKey, StartMode mode) {
+    /**
+     * Snapshot-path start: replay every STATUS/SOS the client missed (from the bounded critical
+     * history, independent of the evicted location window), then send the latest-state snapshot.
+     *
+     * <p>Order matters: the missed critical events are sent <b>before</b> the snapshot frame,
+     * because a client treats the snapshot as "you are now current at atSeq" and would otherwise
+     * drop those criticals as duplicates. If the critical history itself had overflowed for this
+     * client's horizon, {@code truncated} is set so the client knows some intermediate criticals
+     * are unrecoverable and only the snapshot's latest state is authoritative for them.
+     */
+    private StartMode startFromSnapshot(ClientConnection connection, String topicKey,
+                                        long lastSeq, StartMode mode) {
         TopicSnapshot snapshot = snapshotStore.snapshot(topicKey);
-        connection.sendNow(codec.subscribed(topicKey, mode.name(), snapshot.atSequence()));
+        CriticalHistory critical = snapshotStore.criticalEventsAfter(topicKey, lastSeq);
+
+        connection.sendNow(codec.subscribed(topicKey, mode.name(), snapshot.atSequence(),
+                critical.truncated()));
+        for (TripEvent event : critical.events()) {
+            connection.sendReplayEventNow(event);
+        }
         connection.sendNow(codec.snapshot(snapshot));
+
         metrics.resume(mode.name());
+        if (critical.truncated()) {
+            metrics.criticalHistoryTruncated();
+            log.warn("critical_history_truncated topic={} fromSeq={}: some STATUS/SOS older than "
+                    + "the critical-history horizon could not be replayed", topicKey, lastSeq);
+        }
         return mode;
     }
 

@@ -12,6 +12,8 @@ import com.moveinsync.livetrips.core.SubscriptionAuthorizer;
 import com.moveinsync.livetrips.core.TripMetadataSource;
 import com.moveinsync.livetrips.distribution.EventDistributor;
 import com.moveinsync.livetrips.distribution.InProcessEventDistributor;
+import com.moveinsync.livetrips.metrics.LiveTripsMetrics;
+import com.moveinsync.livetrips.distribution.OrderedDispatcher;
 import com.moveinsync.livetrips.gateway.FrameCodec;
 import com.moveinsync.livetrips.service.CachingTripMetadataService;
 import org.slf4j.Logger;
@@ -83,8 +85,8 @@ public class CoreConfig {
 
     @Bean
     @Profile("!redis")
-    public SnapshotStore snapshotStore() {
-        return new InMemorySnapshotStore();
+    public SnapshotStore snapshotStore(LiveTripsProperties props) {
+        return new InMemorySnapshotStore(props.getReplay().getCriticalCapacity());
     }
 
     @Bean
@@ -92,6 +94,26 @@ public class CoreConfig {
     public EventDistributor eventDistributor(LiveTripsProperties props) {
         log.info("Using in-process event distributor (single node, no broker)");
         return new InProcessEventDistributor(props.getNodeId());
+    }
+
+    /**
+     * Wraps the active {@link EventDistributor} so live dispatch is strictly ordered per topic.
+     *
+     * <p>Declared for both profiles: it is the publish path's only route to distribution. In
+     * single-node mode this gives a strict per-topic live-ordering guarantee; in Redis mode it
+     * orders same-node dispatch only (cross-node order is reconciled by sequence at the client).
+     */
+    @Bean(destroyMethod = "shutdown")
+    public OrderedDispatcher orderedDispatcher(EventDistributor distributor,
+                                               LiveTripsProperties props,
+                                               LiveTripsMetrics metrics) {
+        log.info("Ordered dispatch: {} partitions, queue capacity {} per partition",
+                props.getPublish().getDispatchPartitions(),
+                props.getPublish().getDispatchQueueCapacity());
+        return new OrderedDispatcher(distributor,
+                props.getPublish().getDispatchPartitions(),
+                props.getPublish().getDispatchQueueCapacity(),
+                metrics::orderedDispatchDropped);
     }
 
     /**
@@ -119,6 +141,36 @@ public class CoreConfig {
                 new ThreadPoolExecutor.CallerRunsPolicy());
         pool.allowCoreThreadTimeOut(true);
         log.info("WebSocket writer pool: {} threads", threads);
+        return pool;
+    }
+
+    /**
+     * Dedicated pool for the express SOS flush path, so an SOS is not stuck behind location drains
+     * when the main {@link #writerPool} is saturated.
+     *
+     * <p>Rejection policy is deliberately NOT caller-runs: a rejected express flush falls back to
+     * the normal drain (whose poll returns SOS first), so discarding the express <i>attempt</i> on
+     * saturation loses nothing &mdash; running it inline on the offering thread would risk doing a
+     * blocking socket write on a fan-out thread. The {@code expressDraining} flag bounds in-flight
+     * express tasks to one per connection, so this pool is sized for concurrent SOS writers, which
+     * is far fewer than total connections.
+     */
+    @Bean(destroyMethod = "shutdown")
+    public ThreadPoolExecutor sosWriterPool(LiveTripsProperties props) {
+        int threads = Math.max(2, props.getGateway().getWriterThreads() / 4);
+        AtomicLong counter = new AtomicLong();
+        ThreadPoolExecutor pool = new ThreadPoolExecutor(
+                threads, threads,
+                60L, TimeUnit.SECONDS,
+                new ArrayBlockingQueue<>(10_000),
+                r -> {
+                    Thread t = new Thread(r, "ws-sos-writer-" + counter.incrementAndGet());
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.AbortPolicy());
+        pool.allowCoreThreadTimeOut(true);
+        log.info("WebSocket SOS express writer pool: {} threads", threads);
         return pool;
     }
 }

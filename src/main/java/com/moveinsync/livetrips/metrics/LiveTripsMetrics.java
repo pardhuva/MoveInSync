@@ -57,6 +57,9 @@ public class LiveTripsMetrics {
     private final Counter subscribeOk;
     private final Counter publishRejected;
     private final Counter connectionsOpened;
+    private final Counter criticalHistoryTruncated;
+    private final Counter sosExpressDeliveries;
+    private final Counter orderedDispatchDropped;
 
     private final Map<String, Counter> subscribeDenied = new ConcurrentHashMap<>();
     private final Map<String, Counter> connectionsClosed = new ConcurrentHashMap<>();
@@ -96,6 +99,15 @@ public class LiveTripsMetrics {
         this.subscribeOk = Counter.builder("livetrips.subscribe.ok").register(registry);
         this.publishRejected = Counter.builder("livetrips.publish.rejected").register(registry);
         this.connectionsOpened = Counter.builder("livetrips.connections.opened").register(registry);
+        this.criticalHistoryTruncated = Counter.builder("livetrips.resume.critical.truncated")
+                .description("Resumes where some STATUS/SOS were older than the critical-history horizon")
+                .register(registry);
+        this.sosExpressDeliveries = Counter.builder("livetrips.sos.express.deliveries")
+                .description("SOS frames flushed via the dedicated express writer path")
+                .register(registry);
+        this.orderedDispatchDropped = Counter.builder("livetrips.dispatch.dropped")
+                .description("Live dispatches dropped under ordered-dispatcher saturation (recoverable via resume)")
+                .register(registry);
 
         Gauge.builder("livetrips.connections.active", activeConnections, AtomicLong::get)
                 .description("Currently connected subscribers on this node").register(registry);
@@ -178,6 +190,21 @@ public class LiveTripsMetrics {
         resumeByMode.computeIfAbsent(mode,
                 m -> Counter.builder("livetrips.resume").tag("mode", m).register(registry))
                 .increment();
+    }
+
+    /** A resume where the critical (STATUS/SOS) history had overflowed for the client's horizon. */
+    public void criticalHistoryTruncated() {
+        criticalHistoryTruncated.increment();
+    }
+
+    /** An SOS frame flushed through the dedicated express writer path. */
+    public void sosExpressDelivery() {
+        sosExpressDeliveries.increment();
+    }
+
+    /** A live dispatch dropped because the ordered-dispatcher queue was saturated (recoverable). */
+    public void orderedDispatchDropped() {
+        orderedDispatchDropped.increment();
     }
 
     // ---------- periodic gauges ----------

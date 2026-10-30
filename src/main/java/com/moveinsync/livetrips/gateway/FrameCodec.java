@@ -73,6 +73,23 @@ public class FrameCodec {
         return write(m);
     }
 
+    /**
+     * An event delivered as part of a resume (replay window or critical history), marked
+     * {@code "replay": true}.
+     *
+     * <p>This distinction matters to clients and to measurement. A security desk must not re-sound
+     * an alarm for an SOS it is merely recovering after a reconnect, and latency against the 2s SOS
+     * target must be measured on live delivery &mdash; a replayed event's age includes however long
+     * the client was disconnected, which the server cannot bound.
+     */
+    public String replayEvent(TripEvent e) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("kind", "event");
+        m.putAll(eventCodec.toMap(e));
+        m.put("replay", true);
+        return write(m);
+    }
+
     public String snapshot(TopicSnapshot snap) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("kind", "snapshot");
@@ -104,6 +121,16 @@ public class FrameCodec {
 
     public String subscribed(String topic, String mode, long latestSeq) {
         return write(Map.of("kind", "subscribed", "topic", topic, "mode", mode, "latestSeq", latestSeq));
+    }
+
+    /**
+     * Subscribe ack that also tells the client whether the critical (STATUS/SOS) history was
+     * truncated for its resume horizon. When true, some intermediate critical events could not be
+     * replayed and only the snapshot's latest state is authoritative for what is missing.
+     */
+    public String subscribed(String topic, String mode, long latestSeq, boolean criticalTruncated) {
+        return write(Map.of("kind", "subscribed", "topic", topic, "mode", mode,
+                "latestSeq", latestSeq, "criticalTruncated", criticalTruncated));
     }
 
     public String unsubscribed(String topic) {

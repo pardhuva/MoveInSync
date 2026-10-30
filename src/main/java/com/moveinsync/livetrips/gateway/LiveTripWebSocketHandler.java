@@ -52,6 +52,7 @@ public class LiveTripWebSocketHandler extends TextWebSocketHandler {
     private final LiveTripsMetrics metrics;
     private final DeliveryService deliveryService;
     private final ThreadPoolExecutor writerPool;
+    private final ThreadPoolExecutor sosWriterPool;
     private final LiveTripsProperties props;
 
     /** Single small scheduler for handshake timeouts; daemon so it never holds up shutdown. */
@@ -67,7 +68,10 @@ public class LiveTripWebSocketHandler extends TextWebSocketHandler {
                                     FrameCodec codec,
                                     LiveTripsMetrics metrics,
                                     DeliveryService deliveryService,
+                                    @org.springframework.beans.factory.annotation.Qualifier("writerPool")
                                     ThreadPoolExecutor writerPool,
+                                    @org.springframework.beans.factory.annotation.Qualifier("sosWriterPool")
+                                    ThreadPoolExecutor sosWriterPool,
                                     LiveTripsProperties props) {
         this.jwtService = jwtService;
         this.subscriptionService = subscriptionService;
@@ -76,6 +80,7 @@ public class LiveTripWebSocketHandler extends TextWebSocketHandler {
         this.metrics = metrics;
         this.deliveryService = deliveryService;
         this.writerPool = writerPool;
+        this.sosWriterPool = sosWriterPool;
         this.props = props;
     }
 
@@ -86,6 +91,7 @@ public class LiveTripWebSocketHandler extends TextWebSocketHandler {
                 new OutboundQueue(props.getGateway().getQueueCapacity()),
                 codec,
                 writerPool,
+                sosWriterPool,
                 deliveryService);
 
         connection.onClose(subscriptionService::disconnect);

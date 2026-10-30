@@ -60,4 +60,9 @@ public class DeliveryService implements EventDistributor.EventListener, Connecti
     public void onWriteFailure() {
         metrics.writeFailure();
     }
+
+    @Override
+    public void onSosExpressDelivery() {
+        metrics.sosExpressDelivery();
+    }
 }

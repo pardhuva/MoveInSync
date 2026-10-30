@@ -19,6 +19,17 @@ public interface SnapshotStore {
     /** Current state of the topic. Never null; an unknown topic yields an empty snapshot at sequence 0. */
     TopicSnapshot snapshot(String topic);
 
+    /**
+     * The STATUS/SOS events after {@code lastSeq} that are still retained in the bounded critical
+     * history, in ascending sequence order, plus a {@code truncated} flag when older criticals the
+     * client needed were already evicted.
+     *
+     * <p>This is independent of the location-dominated replay window: a location flood can evict
+     * the replay window, but critical events live in their own bounded history, so the snapshot path
+     * can still replay the STATUS/SOS a client missed rather than conveying only the latest status.
+     */
+    CriticalHistory criticalEventsAfter(String topic, long lastSeq);
+
     /** Mark an SOS as resolved so it stops appearing in snapshots. */
     void clearSos(String topic, String eventId);
 }

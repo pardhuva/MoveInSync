@@ -5,7 +5,7 @@ import com.moveinsync.livetrips.core.AuthorizationDecision;
 import com.moveinsync.livetrips.core.EventLog;
 import com.moveinsync.livetrips.core.PublishAuthorizer;
 import com.moveinsync.livetrips.core.SnapshotStore;
-import com.moveinsync.livetrips.distribution.EventDistributor;
+import com.moveinsync.livetrips.distribution.OrderedDispatcher;
 import com.moveinsync.livetrips.error.Errors;
 import com.moveinsync.livetrips.metrics.LiveTripsMetrics;
 import com.moveinsync.livetrips.model.EventType;
@@ -62,7 +62,7 @@ public class PublishService {
 
     private final EventLog eventLog;
     private final SnapshotStore snapshotStore;
-    private final EventDistributor distributor;
+    private final OrderedDispatcher dispatcher;
     private final TripRepository repository;
     private final PublishAuthorizer publishAuthorizer;
     private final LiveTripsMetrics metrics;
@@ -70,14 +70,14 @@ public class PublishService {
 
     public PublishService(EventLog eventLog,
                           SnapshotStore snapshotStore,
-                          EventDistributor distributor,
+                          OrderedDispatcher dispatcher,
                           TripRepository repository,
                           PublishAuthorizer publishAuthorizer,
                           LiveTripsMetrics metrics,
                           @Value("${livetrips.publish.office-topics-enabled:true}") boolean officeTopicsEnabled) {
         this.eventLog = eventLog;
         this.snapshotStore = snapshotStore;
-        this.distributor = distributor;
+        this.dispatcher = dispatcher;
         this.repository = repository;
         this.publishAuthorizer = publishAuthorizer;
         this.metrics = metrics;
@@ -97,9 +97,15 @@ public class PublishService {
             log.warn("publish_denied user={} tenant={} role={} trip={} reason={}",
                     principal.userId(), principal.tenantId(), principal.role(),
                     command.tripId(), decision.reason());
-            throw decision.reason() == AuthorizationDecision.DenyReason.UNKNOWN_TOPIC
-                    ? Errors.unknownTrip()
-                    : Errors.forbidden();
+            // A trip in ANOTHER tenant must be indistinguishable from a trip that does not exist:
+            // returning 403 for one and 404 for the other would let any authenticated caller probe
+            // trip ids and learn which exist in other tenants. Both therefore answer "no such trip".
+            // ROLE_NOT_PERMITTED and friends still answer 403, which leaks nothing across tenants:
+            // reaching that branch already means the caller is inside the resource's own tenant.
+            throw switch (decision.reason()) {
+                case UNKNOWN_TOPIC, TENANT_MISMATCH -> Errors.unknownTrip();
+                default -> Errors.forbidden();
+            };
         }
 
         TripMeta meta = repository.findTrip(command.tripId());
@@ -112,22 +118,37 @@ public class PublishService {
         long ingestTimestamp = System.currentTimeMillis();
         String eventId = UUID.randomUUID().toString();
 
-        TripEvent base = TripEvent.builder()
+        // A template builder shared across topics. Topic is stamped per iteration below; each
+        // build() produces a distinct immutable event. (A topic is mandatory on a built event, so
+        // the template is never built without one.)
+        TripEvent.Builder base = TripEvent.builder()
                 .eventId(eventId)
                 .type(command.type())
                 .tripId(meta.tripId())
                 .cabId(meta.cabId())
                 .officeId(meta.officeId())
                 .payload(command.payload())
-                .originTimestampMs(ingestTimestamp)
-                .build();
+                .originTimestampMs(ingestTimestamp);
 
+        boolean isSos = command.type() == EventType.SOS;
         Map<String, Long> sequences = new LinkedHashMap<>();
         for (Topic topic : topicsFor(meta, command.type())) {
-            TripEvent sequenced = eventLog.append(base.toBuilder().topic(topic).build());
-            snapshotStore.record(sequenced);
-            distributor.publish(sequenced);
-            sequences.put(topic.key(), sequenced.sequence());
+            final Topic t = topic;
+            TripEvent sequenced;
+            if (isSos) {
+                // SOS bypasses the ordered partitions so it skips ahead of queued traffic at the
+                // dispatch stage too. Its true position is preserved by its sequence number (the log
+                // is still appended in order) and by the per-connection express lane.
+                sequenced = eventLog.append(base.topic(t).build());
+                snapshotStore.record(sequenced);
+                dispatcher.dispatchImmediate(sequenced);
+            } else {
+                // Sequence assignment and enqueue are atomic per topic, so live distribution happens
+                // in strict sequence order. The fan-out itself runs off-lock on a partition thread.
+                sequenced = dispatcher.dispatchOrdered(t.key(), () -> eventLog.append(base.topic(t).build()));
+                snapshotStore.record(sequenced);
+            }
+            sequences.put(t.key(), sequenced.sequence());
         }
 
         metrics.published(command.type());

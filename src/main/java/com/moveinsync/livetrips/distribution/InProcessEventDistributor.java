@@ -11,8 +11,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p>This is the default so the service runs, and every guarantee can be tested, with no broker
  * and no Docker. The multi-node behaviour it stands in for is exercised by
- * {@code TwoNodeFailoverTest}, which wires two gateway instances over a shared distributor and
- * shared replay buffer to reproduce a node crash.
+ * {@code NodeCrashRecoveryTest}, which wires two gateway instances over a shared event log and
+ * snapshot store to reproduce a node crash.
  *
  * <p>Interest tracking is kept even though it is not needed for routing here, so the two
  * implementations behave identically from the caller's point of view and the "interested topics"

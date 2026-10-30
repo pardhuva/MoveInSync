@@ -17,8 +17,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * Space is O(topics &times; capacity) events.
  *
  * <p><b>Memory cost.</b> With capacity C per topic and T active topics, worst-case retained
- * events = C &times; T. At ~200 bytes per event that is the replay memory budget; it is
- * documented and configurable so an operator can trade resume depth against RAM.
+ * events = C &times; T. At the measured ~230 bytes JSON wire size per event (heap footprint is
+ * larger &mdash; see {@code docs/COMPLEXITY.md}) that is the replay memory budget; it is documented
+ * and configurable so an operator can trade resume depth against RAM.
  */
 public class InMemoryReplayBuffer implements ReplayBuffer {
 

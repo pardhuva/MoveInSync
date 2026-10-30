@@ -2,6 +2,7 @@ package com.moveinsync.livetrips.gateway;
 
 import com.moveinsync.livetrips.auth.AuthenticatedPrincipal;
 import com.moveinsync.livetrips.core.OutboundQueue;
+import com.moveinsync.livetrips.model.EventType;
 import com.moveinsync.livetrips.model.TripEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,10 +50,14 @@ public class ClientConnection {
     private final OutboundQueue queue;
     private final FrameCodec codec;
     private final Executor writerPool;
+    /** Dedicated pool for flushing SOS, so an SOS never waits behind location drains on a saturated main pool. */
+    private final Executor sosWriterPool;
     private final ConnectionObserver observer;
 
     private final ReentrantLock writeLock = new ReentrantLock();
     private final AtomicBoolean draining = new AtomicBoolean(false);
+    /** Separate from {@link #draining}: an express SOS flush may be scheduled while a normal drain runs. */
+    private final AtomicBoolean expressDraining = new AtomicBoolean(false);
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     private volatile AuthenticatedPrincipal principal;
@@ -61,6 +66,10 @@ public class ClientConnection {
 
     private final long connectedAtMs = System.currentTimeMillis();
     private final AtomicLong writeFailures = new AtomicLong();
+    /** Express flushes that gave up because a normal drain held the write lock. */
+    private final AtomicLong expressLockContended = new AtomicLong();
+    /** Express flushes that acquired the lock and wrote at least one SOS. */
+    private final AtomicLong expressFlushes = new AtomicLong();
     private volatile String closeReason;
 
     /** Invoked exactly once when this connection closes, so the registry can clean up. */
@@ -68,15 +77,26 @@ public class ClientConnection {
 
     public ClientConnection(ClientTransport transport, OutboundQueue queue,
                             FrameCodec codec, Executor writerPool) {
-        this(transport, queue, codec, writerPool, ConnectionObserver.NOOP);
+        this(transport, queue, codec, writerPool, writerPool, ConnectionObserver.NOOP);
     }
 
     public ClientConnection(ClientTransport transport, OutboundQueue queue,
                             FrameCodec codec, Executor writerPool, ConnectionObserver observer) {
+        this(transport, queue, codec, writerPool, writerPool, observer);
+    }
+
+    /**
+     * @param sosWriterPool dedicated pool for the express SOS flush path. May be the same instance
+     *                      as {@code writerPool} (then express drains share the main pool and lose
+     *                      their saturation advantage, but behaviour is otherwise identical).
+     */
+    public ClientConnection(ClientTransport transport, OutboundQueue queue, FrameCodec codec,
+                            Executor writerPool, Executor sosWriterPool, ConnectionObserver observer) {
         this.transport = transport;
         this.queue = queue;
         this.codec = codec;
         this.writerPool = writerPool;
+        this.sosWriterPool = sosWriterPool == null ? writerPool : sosWriterPool;
         this.observer = observer == null ? ConnectionObserver.NOOP : observer;
     }
 
@@ -114,6 +134,14 @@ public class ClientConnection {
 
     public long connectedAtMs() {
         return connectedAtMs;
+    }
+
+    public long expressLockContended() {
+        return expressLockContended.get();
+    }
+
+    public long expressFlushes() {
+        return expressFlushes.get();
     }
 
     public long writeFailures() {
@@ -164,9 +192,85 @@ public class ClientConnection {
         if (outcome == OutboundQueue.OfferOutcome.REJECTED_OVERFLOW) {
             closeSlowConsumer();
         } else {
+            // An SOS is flushed through the dedicated express path so it does not wait behind
+            // location drains when the main writer pool is saturated. The normal drain is still
+            // scheduled to flush the main lane; whichever path runs first removes the SOS exactly
+            // once (both poll the same synchronized queue).
+            if (event.type() == EventType.SOS) {
+                scheduleExpressDrain();
+            }
             scheduleDrain();
         }
         return outcome;
+    }
+
+    /** Schedule an express SOS flush on the dedicated pool, unless one is already in flight. */
+    private void scheduleExpressDrain() {
+        if (expressDraining.compareAndSet(false, true)) {
+            try {
+                sosWriterPool.execute(this::expressDrain);
+            } catch (RuntimeException ex) {
+                // Express pool saturated/rejected: fall back to the normal drain (its poll() returns
+                // SOS first anyway). Release the flag so a later SOS can retry the express path.
+                expressDraining.set(false);
+            }
+        }
+    }
+
+    /**
+     * Flush only the SOS express lane to the socket. Kept short (SOS only) so it returns its
+     * express-pool thread quickly.
+     *
+     * <p><b>Never blocks on the write lock.</b> It uses {@code tryLock}: if a normal drain already
+     * holds the lock, that drain is itself writing this SOS (its {@code poll()} returns the express
+     * lane first), so there is nothing to gain by waiting &mdash; and waiting is actively harmful.
+     * Blocking here pins express-pool threads behind 256-frame batch writes, so under a heavy
+     * backlog the whole (small) express pool parks on locks and SOS delivery starves. That is a
+     * measured regression, not a theoretical one: blocking here pushed SOS p99 from ~475 ms to
+     * ~10 s in the load simulation.
+     *
+     * <p>The SOS can never be stranded by giving up: {@link #offer} always schedules a normal drain
+     * as well, and that drain polls the express lane first.
+     */
+    private void expressDrain() {
+        boolean acquired = false;
+        try {
+            if (!isOpen()) {
+                return;
+            }
+            acquired = writeLock.tryLock();
+            if (!acquired) {
+                expressLockContended.incrementAndGet();
+                return; // a normal drain holds the lock and will deliver this SOS first
+            }
+            expressFlushes.incrementAndGet();
+            try {
+                TripEvent sos;
+                while (isOpen() && (sos = queue.pollSos()) != null) {
+                    try {
+                        transport.send(codec.event(sos));
+                        recordDelivered(sos);
+                        observer.onSosExpressDelivery();
+                    } catch (Exception ex) {
+                        writeFailures.incrementAndGet();
+                        observer.onWriteFailure();
+                        log.debug("express write failed for connection {}: {}",
+                                id(), ex.getClass().getSimpleName());
+                        close("WRITE_FAILED");
+                        return;
+                    }
+                }
+            } finally {
+                writeLock.unlock();
+            }
+        } finally {
+            expressDraining.set(false);
+            // Only re-arm if we actually held the lock and did work; re-arming after a failed
+            // tryLock would spin the express pool against a lock we cannot get.
+            if (acquired && isOpen() && queue.hasSos()) {
+                scheduleExpressDrain();
+            }
+        }
     }
 
     /**
@@ -197,6 +301,19 @@ public class ClientConnection {
     /** Write an event immediately (used during replay), recording it as delivered. */
     public boolean sendEventNow(TripEvent event) {
         boolean ok = sendNow(codec.event(event));
+        if (ok) {
+            recordDelivered(event);
+        }
+        return ok;
+    }
+
+    /**
+     * Send an event as part of a resume, marked {@code replay} so the client can tell a recovered
+     * event from a live one (and so latency measurement does not count a recovered event's age,
+     * which includes the client's offline time, against the live SOS target).
+     */
+    public boolean sendReplayEventNow(TripEvent event) {
+        boolean ok = sendNow(codec.replayEvent(event));
         if (ok) {
             recordDelivered(event);
         }

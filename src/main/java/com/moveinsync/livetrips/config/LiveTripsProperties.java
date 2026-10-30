@@ -24,6 +24,8 @@ public class LiveTripsProperties {
     @NestedConfigurationProperty
     private Gateway gateway = new Gateway();
     @NestedConfigurationProperty
+    private Publish publish = new Publish();
+    @NestedConfigurationProperty
     private Demo demo = new Demo();
 
     public String getNodeId() { return nodeId; }
@@ -34,6 +36,8 @@ public class LiveTripsProperties {
     public void setReplay(Replay replay) { this.replay = replay; }
     public Gateway getGateway() { return gateway; }
     public void setGateway(Gateway gateway) { this.gateway = gateway; }
+    public Publish getPublish() { return publish; }
+    public void setPublish(Publish publish) { this.publish = publish; }
     public Demo getDemo() { return demo; }
     public void setDemo(Demo demo) { this.demo = demo; }
 
@@ -58,17 +62,30 @@ public class LiveTripsProperties {
          * snapshot instead of a replay. Memory: capacity x active topics x ~200 bytes.
          */
         private int capacity = 500;
+        /**
+         * Per-topic bound on the ordered STATUS/SOS history, kept independently of the
+         * location-dominated replay window so the snapshot path can still replay missed criticals.
+         * A location flood evicts {@code capacity} but not this. Beyond this many criticals the
+         * resume reports truncation.
+         */
+        private int criticalCapacity = 256;
         /** Redis mode: how long an idle topic's log and snapshot survive before reclamation. */
         private Duration topicTtl = Duration.ofHours(24);
 
         public int getCapacity() { return capacity; }
         public void setCapacity(int capacity) { this.capacity = capacity; }
+        public int getCriticalCapacity() { return criticalCapacity; }
+        public void setCriticalCapacity(int criticalCapacity) { this.criticalCapacity = criticalCapacity; }
         public Duration getTopicTtl() { return topicTtl; }
         public void setTopicTtl(Duration topicTtl) { this.topicTtl = topicTtl; }
     }
 
     public static class Gateway {
-        /** Per-connection outbound queue bound, in events. */
+        /**
+         * Per-connection outbound queue capacity, in events. Note: the SOS express lane and the
+         * main lane are bounded independently, so the hard worst-case total per connection is
+         * {@code 2 x queueCapacity} entries (see OutboundQueue). Steady-state is O(cabs watched).
+         */
         private int queueCapacity = 1000;
         /** Shared pool draining connection queues to sockets; sized for concurrent writers. */
         private int writerThreads = 32;
@@ -82,11 +99,42 @@ public class LiveTripsProperties {
         public void setMaxTopicsPerConnection(int v) { this.maxTopicsPerConnection = v; }
     }
 
+    public static class Publish {
+        /**
+         * Number of single-thread partitions used for ordered live dispatch. A topic maps to one
+         * partition by hash, so its events are distributed strictly in sequence order. More
+         * partitions = more cross-topic parallelism; topics sharing a partition are serialised.
+         */
+        private int dispatchPartitions = 16;
+        /**
+         * Per-partition bounded queue. On saturation a live dispatch is dropped (counted by
+         * livetrips.dispatch.dropped) rather than blocking the publisher; the event is already in
+         * the replay log, so a client recovers it by resuming after it sees the sequence gap.
+         */
+        private int dispatchQueueCapacity = 20_000;
+
+        public int getDispatchPartitions() { return dispatchPartitions; }
+        public void setDispatchPartitions(int v) { this.dispatchPartitions = v; }
+        public int getDispatchQueueCapacity() { return dispatchQueueCapacity; }
+        public void setDispatchQueueCapacity(int v) { this.dispatchQueueCapacity = v; }
+    }
+
     public static class Demo {
-        /** Seed demo tenants/offices/trips at startup so the service is immediately usable. */
-        private boolean seedEnabled = true;
+        /**
+         * Seed demo tenants/offices/trips at startup. Default OFF: seeding fabricated tenants into
+         * a real deployment would be wrong. Turned on by the 'demo' profile.
+         */
+        private boolean seedEnabled = false;
+        /**
+         * Expose POST /api/v1/dev/token, which mints a signed token for ANY claimed identity.
+         * Default OFF -- it is a deliberate hole that exists only so a reviewer can obtain a token
+         * without an identity provider. Turned on by the 'demo' profile.
+         */
+        private boolean tokenEndpointEnabled = false;
 
         public boolean isSeedEnabled() { return seedEnabled; }
         public void setSeedEnabled(boolean v) { this.seedEnabled = v; }
+        public boolean isTokenEndpointEnabled() { return tokenEndpointEnabled; }
+        public void setTokenEndpointEnabled(boolean v) { this.tokenEndpointEnabled = v; }
     }
 }

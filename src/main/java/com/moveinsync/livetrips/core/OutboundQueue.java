@@ -41,10 +41,16 @@ import java.util.Map;
  * everywhere"). The authoritative, fully-ordered log is the replay buffer; clients reconcile
  * using the per-topic sequence number.
  *
- * <h2>Memory cost per connection</h2>
- * Bounded by {@code capacity} entries. Location entries collapse to at most one per cab, so the
- * steady-state size is O(distinct cabs the connection watches). At ~200 bytes/event a
- * capacity of 1,000 is ~200 KB worst case per connection.
+ * <h2>Memory cost per connection &mdash; exact bound</h2>
+ * The SOS express lane and the main lane are each bounded independently by {@code capacity}
+ * (see {@link #offer}), so the hard worst-case total is <b>{@code 2 x capacity} entries</b>, not
+ * {@code capacity}. With the default {@code capacity = 1000} that is up to 2,000 entries. The SOS
+ * lane is near-empty in normal operation (SOS are rare), and location entries in the main lane
+ * collapse to at most one per cab, so the <i>steady-state</i> size is O(distinct cabs the
+ * connection watches). Using the measured JSON wire size (see {@code docs/COMPLEXITY.md}; heap
+ * footprint per event is larger and is an estimate), 2,000 entries is on the order of a few
+ * hundred KB worst case per connection. The {@code 2 x capacity} bound is pinned by
+ * {@code OutboundQueueBoundTest}.
  *
  * <p>Not thread-safe-free: all mutating methods are {@code synchronized}. Contention is low in
  * practice (one offering thread, one polling thread per connection).
@@ -175,6 +181,25 @@ public class OutboundQueue {
             return e.getValue();
         }
         return null;
+    }
+
+    /**
+     * Remove and return the next SOS only (from the express lane), or {@code null} if none.
+     * Used by the dedicated express drain path so it can flush SOS without touching the main lane.
+     * Shares the same synchronized state as {@link #poll()}, so an SOS is removed exactly once even
+     * if an express drain and a normal drain run against this queue.
+     */
+    public synchronized TripEvent pollSos() {
+        if (!sos.isEmpty()) {
+            totalDelivered++;
+            return sos.pollFirst();
+        }
+        return null;
+    }
+
+    /** True if the express lane currently holds at least one SOS. */
+    public synchronized boolean hasSos() {
+        return !sos.isEmpty();
     }
 
     public synchronized int size() {
