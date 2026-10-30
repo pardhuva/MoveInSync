@@ -38,3 +38,6 @@ desktop.ini
 # Logs
 logs/
 *.log
+
+# Regenerated on every load run; the curated record is benchmarks/RESULTS.md
+benchmarks/load-result-latest.txt

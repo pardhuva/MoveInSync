@@ -1,0 +1,67 @@
+# One-command run of the full multi-node topology:
+#   docker compose up --build
+#
+# Brings up:
+#   - redis        : the shared backbone (sequencer, replay log, snapshots, pub/sub)
+#   - gateway-1/2  : two gateway nodes in 'redis' profile, sharing that backbone
+#   - lb (nginx)   : a WebSocket-aware load balancer in front, published on :8080
+#
+# Then connect WebSocket clients to ws://localhost:8080/ws/live and publish via
+# http://localhost:8080/api/v1/... . Killing a node (`docker compose kill gateway-1`)
+# demonstrates node-crash recovery: clients reconnect through the LB to gateway-2 and resume.
+
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF on so the replay log and snapshots survive a redis restart.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  gateway-1:
+    build: .
+    environment:
+      # 'demo' opens POST /api/v1/dev/token so a reviewer can obtain a token with no identity
+      # provider. Remove 'demo' for anything other than this local demonstration.
+      SPRING_PROFILES_ACTIVE: redis,demo
+      LIVETRIPS_NODE_ID: gateway-1
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # DEV-ONLY shared signing key so a token issued on one node verifies on the other.
+      # NOT a secret and NOT for production: override with a real key from a secret manager.
+      LIVETRIPS_AUTH_JWT_SECRET: ${LIVETRIPS_AUTH_JWT_SECRET:-dev-only-insecure-signing-key-change-me-0001}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  gateway-2:
+    build: .
+    environment:
+      # 'demo' opens POST /api/v1/dev/token so a reviewer can obtain a token with no identity
+      # provider. Remove 'demo' for anything other than this local demonstration.
+      SPRING_PROFILES_ACTIVE: redis,demo
+      LIVETRIPS_NODE_ID: gateway-2
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      LIVETRIPS_AUTH_JWT_SECRET: ${LIVETRIPS_AUTH_JWT_SECRET:-dev-only-insecure-signing-key-change-me-0001}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  lb:
+    image: nginx:1.27-alpine
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - gateway-1
+      - gateway-2
+    restart: unless-stopped
+
