@@ -56,19 +56,7 @@ public class RedisEventDistributor implements EventDistributor {
     private volatile EventListener listener;
 
     /** One listener instance reused for every channel; the event itself carries its topic. */
-    private final MessageListener messageListener = (message, pattern) -> {
-        EventListener l = listener;
-        if (l == null) {
-            return;
-        }
-        try {
-            TripEvent event = codec.decode(new String(message.getBody(), StandardCharsets.UTF_8));
-            l.onEvent(event);
-        } catch (RuntimeException ex) {
-            // A malformed message must never kill the listener thread: log and drop.
-            log.warn("Dropping undecodable event from backbone: {}", ex.getMessage());
-        }
-    };
+    private final MessageListener messageListener;
 
     public RedisEventDistributor(StringRedisTemplate redis,
                                  RedisMessageListenerContainer normalContainer,
@@ -80,6 +68,20 @@ public class RedisEventDistributor implements EventDistributor {
         this.sosContainer = sosContainer;
         this.codec = codec;
         this.nodeId = nodeId;
+        // Built here, not as a field initializer, so it captures the already-assigned codec.
+        this.messageListener = (message, pattern) -> {
+            EventListener l = listener;
+            if (l == null) {
+                return;
+            }
+            try {
+                TripEvent event = codec.decode(new String(message.getBody(), StandardCharsets.UTF_8));
+                l.onEvent(event);
+            } catch (RuntimeException ex) {
+                // A malformed message must never kill the listener thread: log and drop.
+                log.warn("Dropping undecodable event from backbone: {}", ex.getMessage());
+            }
+        };
     }
 
     @Override

@@ -1,3 +1,4 @@
+
 package com.moveinsync.livetrips.config;
 
 import com.moveinsync.livetrips.codec.TripEventCodec;
@@ -13,26 +14,12 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
-import org.springframework.core.task.SimpleAsyncTaskExecutor;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
 
-/**
- * Multi-node mode. Active only under the {@code redis} profile
- * ({@code SPRING_PROFILES_ACTIVE=redis}), which is what {@code docker compose up} sets.
- *
- * <p>Replaces three beans with their shared-state equivalents. That substitution is the whole of
- * "scale out": nothing in the gateway, service or core layers changes, because they depend on
- * {@link EventLog}, {@link SnapshotStore} and {@link EventDistributor} as interfaces.
- *
- * <h2>Two listener containers, on purpose</h2>
- * SOS messages are consumed by their own container, which means their own Redis connection and
- * their own dispatch threads. If location traffic and SOS shared a container, a backlog of
- * location messages would sit in front of an SOS in the same consumer queue &mdash; precisely the
- * head-of-line blocking the priority-lane requirement forbids. Separating them makes the SOS path
- * independent at this hop.
- */
 @Configuration
 @Profile("redis")
 public class RedisDistributionConfig {
@@ -51,37 +38,57 @@ public class RedisDistributionConfig {
     @Bean
     public SnapshotStore snapshotStore(StringRedisTemplate redis, TripEventCodec codec,
                                        EventLog eventLog, LiveTripsProperties props) {
-        return new RedisSnapshotStore(redis, codec, eventLog, props.getReplay().getTopicTtl());
+        return new RedisSnapshotStore(redis, codec, eventLog, props.getReplay().getTopicTtl(),
+                props.getReplay().getCriticalCapacity());
     }
 
-    /** Container for ordinary (location, status) topic channels. */
+    private static ThreadPoolTaskExecutor boundedDispatchPool(String threadPrefix, int threads,
+                                                              int queueCapacity) {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(threads);
+        executor.setMaxPoolSize(threads);
+        executor.setQueueCapacity(queueCapacity);
+        executor.setThreadNamePrefix(threadPrefix);
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);
+        executor.setAwaitTerminationSeconds(5);
+        executor.initialize();
+        return executor;
+    }
+
+    @Bean(name = "redisNormalExecutor", destroyMethod = "shutdown")
+    public ThreadPoolTaskExecutor redisNormalExecutor() {
+        return boundedDispatchPool("redis-sub-", 8, 10_000);
+    }
+
+    @Bean(name = "redisSosExecutor", destroyMethod = "shutdown")
+    public ThreadPoolTaskExecutor redisSosExecutor() {
+        return boundedDispatchPool("redis-sos-", 4, 5_000);
+    }
+
     @Bean(name = "normalListenerContainer", destroyMethod = "destroy")
-    public RedisMessageListenerContainer normalListenerContainer(RedisConnectionFactory factory) {
+    public RedisMessageListenerContainer normalListenerContainer(
+            RedisConnectionFactory factory,
+            @Qualifier("redisNormalExecutor") ThreadPoolTaskExecutor redisNormalExecutor) {
         RedisMessageListenerContainer container = new RedisMessageListenerContainer();
         container.setConnectionFactory(factory);
-        container.setTaskExecutor(new SimpleAsyncTaskExecutor("redis-sub-"));
-        container.afterPropertiesSet();
-        container.start();
+        container.setTaskExecutor(redisNormalExecutor);
         return container;
     }
 
-    /** Dedicated container (and therefore connection and threads) for the SOS priority lane. */
     @Bean(name = "sosListenerContainer", destroyMethod = "destroy")
-    public RedisMessageListenerContainer sosListenerContainer(RedisConnectionFactory factory) {
+    public RedisMessageListenerContainer sosListenerContainer(
+            RedisConnectionFactory factory,
+            @Qualifier("redisSosExecutor") ThreadPoolTaskExecutor redisSosExecutor) {
         RedisMessageListenerContainer container = new RedisMessageListenerContainer();
         container.setConnectionFactory(factory);
-        SimpleAsyncTaskExecutor executor = new SimpleAsyncTaskExecutor("redis-sos-");
-        container.setTaskExecutor(executor);
-        container.afterPropertiesSet();
-        container.start();
+        container.setTaskExecutor(redisSosExecutor);
         return container;
     }
 
     @Bean
     public EventDistributor eventDistributor(
             StringRedisTemplate redis,
-            // Two beans share this type, so both are qualified explicitly rather than relying on
-            // Spring's parameter-name fallback.
             @Qualifier("normalListenerContainer") RedisMessageListenerContainer normalListenerContainer,
             @Qualifier("sosListenerContainer") RedisMessageListenerContainer sosListenerContainer,
             TripEventCodec codec,
